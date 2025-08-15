@@ -1,0 +1,455 @@
+import os
+import re
+import time
+import json
+import zipfile
+import requests
+import pandas as pd
+from io import StringIO
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from typing import Tuple, Dict, Optional
+from groq import Groq    # pip install groq (or replace with your LLM client)
+from pprint import pprint
+
+# -------------------------
+# Load environment
+# -------------------------
+load_dotenv()
+MAPBOX_TOKEN = os.getenv("Your_API_Key")
+OPENWEATHER_KEY = os.getenv("Your_API_Key")
+GROQ_API_KEY = os.getenv("Your_API_Key")
+# Optional override for direct csv url
+DEFAULT_NCRB_PAGE = os.getenv("NCRB_PORTAL_PAGE") or ""
+
+HEADERS = {"User-Agent": "SCAN/1.0 (hackathon)"}
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# -------------------------
+# Helper: web scraper for CSV / zip / json links on a portal page
+# -------------------------
+def find_download_links(page_url: str) -> Dict[str, str]:
+    """Scrape page and return candidate resources {label: absolute_url} (csv/zip/json)."""
+    print("Scraping page:", page_url)
+    r = requests.get(page_url, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    anchors = soup.find_all("a", href=True)
+    candidates = {}
+    for a in anchors:
+        href = a["href"].strip()
+        text = a.get_text().strip()
+        if href.startswith("javascript:") or href.startswith("#"):
+            continue
+        abs_url = urljoin(page_url, href)
+        if re.search(r"\.csv(\?.*)?$", abs_url, re.I):
+            candidates[f"csv: {text or href}"] = abs_url
+        elif re.search(r"\.zip(\?.*)?$", abs_url, re.I):
+            candidates[f"zip: {text or href}"] = abs_url
+        elif re.search(r"\.json(\?.*)?$", abs_url, re.I):
+            candidates[f"json: {text or href}"] = abs_url
+        elif "download" in abs_url.lower() and ("csv" in href.lower() or "csv" in text.lower()):
+            candidates[f"dl: {text or href}"] = abs_url
+    return candidates
+
+def choose_best_link(candidates: Dict[str,str]) -> Optional[Tuple[str,str]]:
+    """Pick best candidate preferring csv > json > zip > dl."""
+    if not candidates:
+        return None
+    for prefix in ("csv:", "json:", "zip:", "dl:"):
+        for k,v in candidates.items():
+            if k.lower().startswith(prefix):
+                return k,v
+    k = next(iter(candidates.keys()))
+    return k, candidates[k]
+
+def download_file(url: str, cache_name: Optional[str]=None, force: bool=False) -> str:
+    """Download into CACHE_DIR and return local path (cached)."""
+    if not cache_name:
+        fname = re.sub(r"[^\w\-_\.]", "_", url.split("?")[0].split("/")[-1])
+        if not fname:
+            fname = f"download_{int(time.time())}.bin"
+    else:
+        fname = cache_name
+    local_path = os.path.join(CACHE_DIR, fname)
+    if os.path.exists(local_path) and not force:
+        print("Using cached file:", local_path)
+        return local_path
+    print("Downloading:", url)
+    r = requests.get(url, headers=HEADERS, stream=True, timeout=60)
+    r.raise_for_status()
+    with open(local_path, "wb") as f:
+        for chunk in r.iter_content(1024*64):
+            if chunk:
+                f.write(chunk)
+    print("Saved:", local_path)
+    return local_path
+
+def extract_csv_from_zip(zip_path: str) -> Optional[str]:
+    """Extract first CSV from zip and return path."""
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            csvs = [n for n in z.namelist() if n.lower().endswith(".csv")]
+            if not csvs:
+                return None
+            csv_name = csvs[0]
+            out_path = os.path.join(CACHE_DIR, os.path.basename(csv_name))
+            with z.open(csv_name) as src, open(out_path, "wb") as dst:
+                dst.write(src.read())
+            print("Extracted CSV to:", out_path)
+            return out_path
+    except zipfile.BadZipFile:
+        return None
+
+def load_dataframe_from_file(path: str) -> pd.DataFrame:
+    """Load CSV or JSON to pandas DataFrame with fallback encodings."""
+    if path.lower().endswith(".csv"):
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return pd.read_csv(path, encoding="latin1")
+    elif path.lower().endswith(".json"):
+        return pd.read_json(path)
+    else:
+        raise ValueError("Unsupported file type: " + path)
+
+def prepare_safety_lookup_from_df(df: pd.DataFrame, year: Optional[int]=None,
+                                  state_hint="state", district_hint="district") -> Tuple[dict,int]:
+    """Compute total_ipc and safety_score; return lookup dict keyed 'state|district' lowercased."""
+    working = df.copy()
+    cols_lc = {c.lower(): c for c in working.columns}
+    if "year" in cols_lc:
+        if year is None:
+            year = int(working[cols_lc["year"]].max())
+        working = working[working[cols_lc["year"]] == year].copy()
+    else:
+        if year is None:
+            year = -1
+    # numeric columns
+    numeric_cols = working.select_dtypes(include="number").columns.tolist()
+    if len(numeric_cols) == 0:
+        # try to coerce numeric-like columns
+        for c in working.columns:
+            try:
+                working[c] = pd.to_numeric(working[c], errors='coerce')
+            except Exception:
+                pass
+        numeric_cols = working.select_dtypes(include="number").columns.tolist()
+    if len(numeric_cols) == 0:
+        raise ValueError("No numeric columns found to compute totals. Inspect CSV.")
+    working["total_ipc"] = working[numeric_cols].sum(axis=1)
+    max_val = working["total_ipc"].max() if working["total_ipc"].max() > 0 else 1
+    working["safety_score"] = working["total_ipc"].apply(lambda x: int(max(0, min(100, 100 - (x / max_val * 100)))))
+    # find state/district columns by hint or heuristics
+    state_col = cols_lc.get(state_hint) or next((cols_lc[c] for c in cols_lc if "state" in c), None)
+    district_col = cols_lc.get(district_hint) or next((cols_lc[c] for c in cols_lc if "district" in c), None)
+    if not state_col or not district_col:
+        # try alternative names
+        state_col = state_col or next((cols_lc[c] for c in cols_lc if "region" in c or "state" in c), None)
+        district_col = district_col or next((cols_lc[c] for c in cols_lc if "district" in c or "place" in c or "area" in c), None)
+    if not state_col or not district_col:
+        raise ValueError("Could not detect state/district columns. Columns: " + ", ".join(working.columns))
+    working[state_col] = working[state_col].astype(str).str.strip().str.lower()
+    working[district_col] = working[district_col].astype(str).str.strip().str.lower()
+    working["lookup_key"] = working[state_col] + "|" + working[district_col]
+    lookup = working.set_index("lookup_key")["safety_score"].to_dict()
+    return lookup, year
+
+def fetch_and_prepare(crime_page_url: str, force_download: bool=False) -> Tuple[dict,int]:
+    """Master: find links on page, download best, extract CSV, prepare lookup."""
+    candidates = find_download_links(crime_page_url)
+    chosen = choose_best_link(candidates)
+    if not chosen:
+        # maybe user provided direct CSV/ZIP/JSON URL; try treat page_url as file
+        # attempt direct download
+        print("No candidates found on page. Attempting direct download of provided URL.")
+        local = download_file(crime_page_url, force=force_download)
+        if local.lower().endswith(".zip"):
+            csv_local = extract_csv_from_zip(local)
+            if csv_local:
+                local = csv_local
+        df = load_dataframe_from_file(local)
+        lookup, year = prepare_safety_lookup_from_df(df)
+        return lookup, year
+    label, url = chosen
+    print("Chosen dataset:", label, url)
+    local = download_file(url, force=force_download)
+    if local.lower().endswith(".zip"):
+        csv_local = extract_csv_from_zip(local)
+        if csv_local:
+            local = csv_local
+    df = load_dataframe_from_file(local)
+    lookup, year = prepare_safety_lookup_from_df(df)
+    return lookup, year
+
+# -------------------------
+# Geocoding & reverse geocode (Mapbox)
+# -------------------------
+def geocode_place(place: str, country="in") -> Optional[Tuple[float,float,dict]]:
+    q = place.strip()
+    if not q:
+        return None
+    url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{requests.utils.requote_uri(q)}.json"
+    params = {"access_token": MAPBOX_TOKEN, "limit": 1, "country": country}
+    r = requests.get(url, params=params, timeout=12, headers=HEADERS)
+    r.raise_for_status()
+    j = r.json()
+    feats = j.get("features", [])
+    if not feats:
+        return None
+    feat = feats[0]
+    lon, lat = feat["center"]
+    return lon, lat, feat
+
+def reverse_geocode_admin(lon: float, lat: float) -> Dict[str, Optional[str]]:
+    url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json"
+    params = {"access_token": MAPBOX_TOKEN, "limit": 5, "types": "region,place,district,locality"}
+    r = requests.get(url, params=params, timeout=12, headers=HEADERS)
+    r.raise_for_status()
+    j = r.json()
+    props = {"region": None, "place": None, "district": None, "locality": None}
+    for feat in j.get("features", []):
+        types = feat.get("place_type", [])
+        text = feat.get("text")
+        if "region" in types and not props["region"]:
+            props["region"] = text
+        if "place" in types and not props["place"]:
+            props["place"] = text
+        if "district" in types and not props["district"]:
+            props["district"] = text
+        if "locality" in types and not props["locality"]:
+            props["locality"] = text
+    return props
+
+# -------------------------
+# Directions (Mapbox)
+# -------------------------
+def get_routes_mapbox(start_lonlat: Tuple[float,float], end_lonlat: Tuple[float,float]) -> dict:
+    coords = f"{start_lonlat[0]},{start_lonlat[1]};{end_lonlat[0]},{end_lonlat[1]}"
+    url = f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/{coords}"
+    params = {"alternatives":"true", "geometries":"geojson", "overview":"full", "access_token": MAPBOX_TOKEN}
+    r = requests.get(url, params=params, timeout=20, headers=HEADERS)
+    r.raise_for_status()
+    jd = r.json()
+    routes = []
+    for i, rt in enumerate(jd.get("routes", [])):
+        routes.append({
+            "id": str(i+1),
+            "distance_km": rt["distance"]/1000.0,
+            "duration_min": rt["duration"]/60.0,
+            "geometry": rt.get("geometry")
+        })
+    return {"routes": routes}
+
+# -------------------------
+# Weather (OpenWeather)
+# -------------------------
+def get_weather_for_place(place_name: str) -> Dict[str, Optional[float]]:
+    ge = geocode_place(place_name)
+    if not ge:
+        return {"desc": None, "temp": None, "risk": 0.0}
+    lon, lat, _ = ge
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    params = {"lat": lat, "lon": lat if False else lat, "lon": lon, "appid": OPENWEATHER_KEY, "units": "metric"}
+    r = requests.get(url, params=params, timeout=12, headers=HEADERS)
+    if r.status_code != 200:
+        return {"desc": None, "temp": None, "risk": 0.0}
+    jd = r.json()
+    weather_main = jd.get("weather", [{}])[0].get("main", "").lower()
+    temp = jd.get("main", {}).get("temp")
+    wind = jd.get("wind", {}).get("speed", 0)
+    risk = 0.0
+    if any(k in weather_main for k in ("rain","storm","thunder","snow","hail")):
+        risk += 0.6
+    if wind and wind > 10:
+        risk += 0.2
+    risk = min(1.0, risk)
+    return {"desc": weather_main or "", "temp": temp, "risk": round(risk,2)}
+
+# -------------------------
+# Scoring logic
+# -------------------------
+def deterministic_score(route_metrics: dict, preference: str="FASTEST") -> int:
+    t = route_metrics.get("travel_time", 999.0)
+    traffic = route_metrics.get("traffic_level", 0.5)
+    wr = route_metrics.get("weather_risk", 0.0)
+    safety = route_metrics.get("safety_score", 50) / 100.0
+    co2 = route_metrics.get("co2", 1.0)
+    time_norm = max(0.0, min(1.0, 1 - (t / 120.0)))
+    traffic_norm = 1 - traffic
+    weather_norm = 1 - wr
+    co2_norm = max(0.0, min(1.0, 1 - (co2 / 10.0)))
+    w_time = 0.3; w_traffic = 0.15; w_weather = 0.15; w_safety = 0.3; w_co2 = 0.1
+    pref = (preference or "FASTEST").upper()
+    if pref == "SAFEST":
+        w_safety += 0.25; w_time -= 0.1
+    elif pref == "ECO":
+        w_co2 += 0.25; w_time -= 0.1
+    total_w = w_time + w_traffic + w_weather + w_safety + w_co2
+    w_time /= total_w; w_traffic /= total_w; w_weather /= total_w; w_safety /= total_w; w_co2 /= total_w
+    score = (time_norm * w_time + traffic_norm * w_traffic + weather_norm * w_weather + safety * w_safety + co2_norm * w_co2)
+    return int(round(score * 100))
+
+# -------------------------
+# Groq integration (optional)
+# -------------------------
+def groq_explain(pref: str, aggregated_routes: list, start_info: dict, end_info: dict, weather: dict, crime_year: Optional[int]=None) -> str:
+    if not GROQ_API_KEY:
+        # fallback: produce a short deterministic explanation
+        best = max(aggregated_routes, key=lambda x: x["deterministic_score"]) if aggregated_routes else None
+        if not best:
+            return "No routes available."
+        return f"Selected route {best['id']}: ETA {best['travel_time']} min, safety {best['safety_score']}/100. Weather: {weather.get('desc')}."
+    client = Groq(api_key=GROQ_API_KEY)
+    # Build compact prompt (structured)
+    system = "You are SCAN: a concise assistant that recommends routes based on numeric metrics. Output a 2-3 sentence recommendation and a one-line rationale."
+    # Build routes summary
+    routes_text = json.dumps([{
+        "id": r["id"],
+        "travel_time": r["travel_time"],
+        "distance_km": r["distance_km"],
+        "safety_score": r["safety_score"],
+        "weather_risk": r["weather_risk"],
+        "co2": r["co2"],
+        "deterministic_score": r["deterministic_score"]
+    } for r in aggregated_routes], indent=2)
+    user_msg = f"Preference: {pref}\nStart: {start_info.get('place')}\nEnd: {end_info.get('place')}\nWeather: {weather.get('desc')}, temp {weather.get('temp')}\nCrime data year: {crime_year}\nRoutes:\n{routes_text}\n\nProvide:\n- selected_route_id\n- 2-3 sentence recommendation\n- 1-line numeric rationale"
+    try:
+        completion = client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role":"system","content":system},{"role":"user","content":user_msg}],
+            temperature=0.0,
+            max_tokens=200
+        )
+        # Response parsing (best-effort)
+        content = completion.choices[0].message.content if hasattr(completion.choices[0].message, "content") else completion.choices[0].message["content"]
+        return content.strip()
+    except Exception as e:
+        print("Groq call failed:", e)
+        # fallback to deterministic explanation
+        return groq_local_fallback(aggregated_routes, weather)
+
+def groq_local_fallback(aggregated_routes, weather):
+    best = max(aggregated_routes, key=lambda x: x["deterministic_score"]) if aggregated_routes else None
+    if not best:
+        return "No routes available."
+    return f"Selected route {best['id']}: ETA {best['travel_time']} min, safety {best['safety_score']}/100. Weather: {weather.get('desc')}."
+
+# -------------------------
+# High-level compute flow
+# -------------------------
+def compute_recommendation(start_place: str, end_place: str, preference: str, crime_lookup: Optional[dict], crime_year: Optional[int]) -> dict:
+    # geocode
+    s = geocode_place(start_place)
+    e = geocode_place(end_place)
+    if not s or not e:
+        raise RuntimeError("Geocoding failed for start or end. Try more specific names.")
+    s_lon, s_lat, _ = s
+    e_lon, e_lat, _ = e
+    # reverse geocode to admin
+    s_admin = reverse_geocode_admin(s_lon, s_lat)
+    e_admin = reverse_geocode_admin(e_lon, e_lat)
+    # build lookup keys
+    def build_keys(admin):
+        keys=[]
+        region = admin.get("region"); district = admin.get("district"); place = admin.get("place"); locality = admin.get("locality")
+        if region and district:
+            keys.append(f"{region.strip().lower()}|{district.strip().lower()}")
+        if region and place:
+            keys.append(f"{region.strip().lower()}|{place.strip().lower()}")
+        if region and locality:
+            keys.append(f"{region.strip().lower()}|{locality.strip().lower()}")
+        if place:
+            keys.append(place.strip().lower())
+        return keys
+    s_keys = build_keys(s_admin); e_keys = build_keys(e_admin)
+    def lookup_score(keys):
+        if not crime_lookup:
+            return 50
+        for k in keys:
+            if k in crime_lookup:
+                return crime_lookup[k]
+        # substring fallback
+        for k in keys:
+            for lk in crime_lookup.keys():
+                if k in lk or lk in k:
+                    return crime_lookup[lk]
+        return 50
+    s_score = lookup_score(s_keys); e_score = lookup_score(e_keys)
+    weather = get_weather_for_place(end_place)
+    routes_resp = get_routes_mapbox((s_lon, s_lat), (e_lon, e_lat))
+    routes = routes_resp.get("routes", [])
+    aggregated=[]
+    for r in routes:
+        travel_time = round(r["duration_min"],1); distance_km = round(r["distance_km"],2)
+        avg_speed = distance_km / (travel_time / 60) if travel_time>0 else 30
+        traffic_level = max(0.0, min(1.0, 1 - (avg_speed / 60)))
+        co2 = round(0.21 * distance_km,3)
+        safety_score = int(round((s_score + e_score)/2.0))
+        item = {
+            "id": r["id"],
+            "travel_time": travel_time,
+            "distance_km": distance_km,
+            "traffic_level": round(traffic_level,2),
+            "weather_risk": weather["risk"],
+            "safety_score": safety_score,
+            "co2": co2,
+            "geometry": r.get("geometry")
+        }
+        item["deterministic_score"] = deterministic_score(item, preference)
+        aggregated.append(item)
+    # get groq explanation / recommendation
+    explanation = groq_explain(preference, aggregated, {"place":start_place}, {"place":end_place}, weather, crime_year)
+    # determine selected route (prefer groq selected id if given)
+    selected = None
+    # try to parse selected id from groq explanation using simple regex
+    m = re.search(r"route\s*(\d+)", explanation, re.I)
+    if m:
+        rid = m.group(1)
+        selected = next((x for x in aggregated if x["id"]==rid), None)
+    if not selected and aggregated:
+        selected = max(aggregated, key=lambda x: x["deterministic_score"])
+    return {
+        "start": {"place": start_place, "coords": (s_lon, s_lat), "admin": s_admin, "safety_score": s_score},
+        "end": {"place": end_place, "coords": (e_lon, e_lat), "admin": e_admin, "safety_score": e_score},
+        "routes": aggregated,
+        "selected": selected,
+        "explanation": explanation,
+        "weather": weather,
+        "crime_year": crime_year
+    }
+
+# -------------------------
+# CLI demo
+# -------------------------
+def demo_cli():
+    print("=== SCAN (CLI with live NCRB scraper + Groq) ===")
+    page = DEFAULT_NCRB_PAGE or input("Enter data portal page URL or direct CSV/ZIP URL for NCRB-like district CSV: ").strip()
+    try:
+        crime_lookup, crime_year = fetch_and_prepare(page, force_download=False)
+    except Exception as ex:
+        print("Warning: could not load crime data live:", ex)
+        crime_lookup, crime_year = None, None
+    start = input("Start place (e.g., 'Bengaluru'): ").strip()
+    end = input("End place (e.g., 'Chennai'): ").strip()
+    pref = input("Preference (FASTEST / SAFEST / ECO) [FASTEST]: ").strip() or "FASTEST"
+    print("Computing recommendation... (may take ~10s on first run)")
+    try:
+        res = compute_recommendation(start, end, pref, crime_lookup, crime_year)
+        print("\n--- Summary ---")
+        print(f"Start: {res['start']['place']} (safety={res['start']['safety_score']})")
+        print(f"End:   {res['end']['place']} (safety={res['end']['safety_score']})")
+        print("Weather at destination:", res["weather"].get("desc"), res["weather"].get("temp"))
+        print("\nRoutes:")
+        for rt in res["routes"]:
+            sel = " <= selected" if res["selected"] and rt["id"]==res["selected"]["id"] else ""
+            print(f"Route {rt['id']}: {rt['distance_km']} km, {rt['travel_time']} min, safety {rt['safety_score']}, score {rt['deterministic_score']}{sel}")
+        print("\nAI Explanation:\n")
+        print(res["explanation"])
+    except Exception as e:
+        print("Error during compute:", e)
+
+if __name__ == "__main__":
+    demo_cli()
